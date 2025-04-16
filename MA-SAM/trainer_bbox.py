@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -67,7 +66,6 @@ def trainer_run(args, model, snapshot_path, multimask_output, low_res):
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=b_lr, momentum=0.9, weight_decay=0.0001) 
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
-    writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
     max_epoch = args.max_epochs
     stop_epoch = args.stop_epoch
@@ -113,10 +111,6 @@ def trainer_run(args, model, snapshot_path, multimask_output, low_res):
                     param_group['lr'] = lr_
 
             iter_num = iter_num + 1
-            writer.add_scalar('info/lr', lr_, iter_num)
-            writer.add_scalar('info/total_loss', loss, iter_num)
-            writer.add_scalar('info/loss_ce', loss_ce, iter_num)
-            writer.add_scalar('info/loss_dice', loss_dice, iter_num)
 
             logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f' % (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
 
@@ -139,5 +133,4 @@ def trainer_run(args, model, snapshot_path, multimask_output, low_res):
             iterator.close()
             break
 
-    writer.close()
     return "Training Finished!"

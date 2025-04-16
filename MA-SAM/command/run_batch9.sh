@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3 python train.py --root_path "/media/ubuntu/maxiaochuan/MA-SAM/data/Promise12/2D_all_5slice" --output "/media/ubuntu/maxiaochuan/MA-SAM/outputs/batch5" --ckpt "/media/ubuntu/maxiaochuan/MA-SAM/sam_vit_b_01ec64.pth" --batch_size 5

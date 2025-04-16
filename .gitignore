@@ -1,0 +1,10 @@
+data/
+MA-SAM/training_log
+MA-SAM/testing_log
+UC-SAM/uncertainty_contrast
+outputs
+MA-SAM/__pycache__
+MA-SAM/command/training_log
+MA-SAM/command/testing_log
+*/__pycache__/
+*.pyc

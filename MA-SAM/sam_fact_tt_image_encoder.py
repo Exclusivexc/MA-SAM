@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.parameter import Parameter
-from segment_anything.modeling import Sam
+from segment_anything.modeling import Sam, Sam_Un
 
 from typing import Optional, Tuple, Type
 
@@ -436,4 +436,171 @@ class Fact_tt_Sam(nn.Module):
 
     def forward(self, batched_input, multimask_output, image_size):
         return self.sam(batched_input, multimask_output, image_size)
+
+class Fact_tt_un_Sam(nn.Module):
+    """Applies low-rank adaptation to a Sam model's image encoder.
+
+    Args:
+        sam_model: a vision transformer model, see base_vit.py
+        r: rank of FacT_tt
+        num_classes: how many classes the model output, default to the vit model
+        FacT_tt_layer: which layer we apply FacT_tt.
+
+    """
+
+    def __init__(self, sam_model: Sam_Un, r: int, fact_layer=None, s=1):  # s是尺度系数
+        super(Fact_tt_un_Sam, self).__init__()
+
+        assert r > 0
+        base_vit_dim = sam_model.image_encoder.patch_embed.proj.out_channels
+        
+        # dim = base_vit_dim
+        if fact_layer:
+            self.fact_layer = fact_layer
+        else:
+            self.fact_layer = list(
+                range(len(sam_model.image_encoder.blocks)))  
+        # create for storage, then we can init them or load weights
+        self.q_FacTs = []  # These are linear layers
+        self.v_FacTs = []
+
+        self.FacTu = nn.Linear(base_vit_dim, r, bias=False)
+        self.FacTv = nn.Linear(r, base_vit_dim, bias=False)
+        nn.init.zeros_(self.FacTv.weight)
+
+        # lets freeze pre-trained weights
+        for k, v in sam_model.image_encoder.named_parameters():
+            if not '.adapter_' in k:
+                v.requires_grad = False
+
+        # add factors
+        for t_layer_i, blk in enumerate(sam_model.image_encoder.blocks):
+            if t_layer_i not in self.fact_layer:
+                continue
+            w_qkv_linear = blk.attn.qkv
+            self.dim = w_qkv_linear.in_features
+            q_FacTs = nn.Linear(r, r, bias=False)
+            v_FacTs = nn.Linear(r, r, bias=False)
+            self.q_FacTs.append(q_FacTs)
+            self.v_FacTs.append(v_FacTs)
+            blk.attn.qkv = _Fact_tt_qkv(
+                w_qkv_linear,
+                q_FacTs,
+                v_FacTs,
+                s
+            )
+
+            blk.attn = _Fact_tt_Attention(blk.attn)  
+            sam_model.image_encoder.blocks[t_layer_i] = _Fact_tt_Block(blk)  
+        
+        sam_model.image_encoder = _Fact_tt_ImageEncoderViT(sam_model.image_encoder, self.FacTu, self.FacTv)
+        for param_name, param in sam_model.named_parameters():
+            print(param_name, param.requires_grad)
+        
+        self.sam = sam_model
+
+    def save_parameters(self, filename: str) -> None:
+        r"""Only safetensors is supported now.
+
+        pip install safetensor if you do not have one installed yet.
+
+        save both FacT_tt and fc parameters.
+        """
+
+        assert filename.endswith(".pt") or filename.endswith('.pth')
+
+        num_layer = len(self.q_FacTs)  # actually, it is half
+        a_tensors = {f"q_FacTs_{i:03d}": self.q_FacTs[i].weight for i in range(num_layer)}
+        b_tensors = {f"v_FacTs_{i:03d}": self.v_FacTs[i].weight for i in range(num_layer)}
+
+        prompt_encoder_tensors = {}
+        mask_decoder_tensors = {}
+        adapter_tensor = {}
+
+        FacTu_tensors = {}
+        FacTv_tensors = {}
+
+        # save prompt encoder, only `state_dict`, the `named_parameter` is not permitted
+        if isinstance(self.sam, torch.nn.DataParallel) or isinstance(self.sam, torch.nn.parallel.DistributedDataParallel):
+            state_dict = self.sam.module.state_dict()
+        else:
+            state_dict = self.sam.state_dict()
+        for key, value in state_dict.items():
+            if 'prompt_encoder' in key:
+                prompt_encoder_tensors[key] = value
+            if 'mask_decoder' in key:
+                mask_decoder_tensors[key] = value
+            if '.adapter_' in key:
+                adapter_tensor[key] = value
+            if 'FacTu' in key:
+                FacTu_tensors[key] = value
+            if 'FacTv' in key:
+                FacTv_tensors[key] = value
+
+        merged_dict = {**a_tensors, **b_tensors, **FacTu_tensors, **FacTv_tensors, **prompt_encoder_tensors, **mask_decoder_tensors, **adapter_tensor}
+        torch.save(merged_dict, filename)
+
+    def load_parameters(self, filename: str) -> None:
+        r"""Only safetensors is supported now.
+
+        pip install safetensor if you do not have one installed yet.\
+
+        load both FacT_tt and fc parameters.
+        """
+
+        assert filename.endswith(".pt") or filename.endswith('.pth')
+
+        state_dict = torch.load(filename)
+
+        for i, q_FacTs in enumerate(self.q_FacTs):
+            saved_key = f"q_FacTs_{i:03d}"
+            saved_tensor = state_dict[saved_key]
+            q_FacTs.weight = Parameter(saved_tensor)
+
+        for i, v_FacTs in enumerate(self.v_FacTs):
+            saved_key = f"v_FacTs_{i:03d}"
+            saved_tensor = state_dict[saved_key]
+            v_FacTs.weight = Parameter(saved_tensor)
+
+        sam_dict = self.sam.state_dict()
+        sam_keys = sam_dict.keys()
+
+        FacTu_keys = [k for k in sam_keys if 'FacTu' in k]
+        FacTu_values = [state_dict[k] for k in FacTu_keys]
+        FacTu_new_state_dict = {k: v for k, v in zip(FacTu_keys, FacTu_values)}
+        sam_dict.update(FacTu_new_state_dict)
+
+        FacTv_keys = [k for k in sam_keys if 'FacTv' in k]
+        FacTv_values = [state_dict[k] for k in FacTv_keys]
+        FacTv_new_state_dict = {k: v for k, v in zip(FacTv_keys, FacTv_values)}
+        sam_dict.update(FacTv_new_state_dict)
+
+        # load prompt encoder
+        prompt_encoder_keys = [k for k in sam_keys if 'prompt_encoder' in k]
+        prompt_encoder_values = [state_dict[k] for k in prompt_encoder_keys]
+        prompt_encoder_new_state_dict = {k: v for k, v in zip(prompt_encoder_keys, prompt_encoder_values)}
+        sam_dict.update(prompt_encoder_new_state_dict)
+
+        # load mask decoder
+        mask_decoder_keys = [k for k in sam_keys if 'mask_decoder' in k]
+        mask_decoder_values = [state_dict[k] for k in mask_decoder_keys]
+        mask_decoder_new_state_dict = {k: v for k, v in zip(mask_decoder_keys, mask_decoder_values)}
+        sam_dict.update(mask_decoder_new_state_dict)
+
+        # load adapter
+        adapter_keys = [k for k in sam_keys if '.adapter_' in k]
+        adapter_values = [state_dict[k] for k in adapter_keys]
+        adapter_new_state_dict = {k: v for k, v in zip(adapter_keys, adapter_values)}
+        sam_dict.update(adapter_new_state_dict)
+
+        self.sam.load_state_dict(sam_dict)
+
+    def reset_parameters(self) -> None:
+        for w_A in self.w_As:
+            nn.init.kaiming_uniform_(w_A.weight, a=math.sqrt(5))
+        for w_B in self.w_Bs:
+            nn.init.zeros_(w_B.weight)
+
+    def forward(self, batched_input, multimask_output, image_size, uncertainty):
+        return self.sam(batched_input, multimask_output, image_size, uncertainty)
 
